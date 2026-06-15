@@ -12,14 +12,56 @@ Two tracks: production chat (live SSE streaming) and evaluation (offline batch w
 
 ---
 
+## Features
+
+- **AI character assistant** (`/chat`) — conversational agent that creates, edits, and manages characters using the shared tool registry; launches multi-character scenes from the chat interface.
+- **Multi-character conversations** (`/conversations`) — background-job simulation of scenes with ORCHESTRATOR or ROUND_ROBIN turn strategies (1–500 turns), streamed in real time.
+- **MCP server** — the same 9 tools exposed to any external agent client over StreamableHTTP, JWT-authenticated.
+- **Behavioural-fidelity evaluation** (`/evaluation`) — offline 4-pass pipeline (generate → judge → reconstruct → drift) measuring whether generated dialogue preserves personality signal end-to-end.
+- **LLM usage & cost tracking** (`/settings/usage`) — per-call logging of model, prompt hash, latency, and cost across all production and evaluation runs.
+
+---
+
 ## Architecture
 
-| Workspace          | Purpose                                                   | Port |
+| Path               | Purpose                                                   | Port |
 | ------------------ | --------------------------------------------------------- | ---- |
 | `frontend/`        | Next.js 16 app — App Router, Supabase Auth, Prisma client | 3000 |
 | `mcp_server/`      | Express 5 MCP server — tool registry host                 | 3001 |
 | `packages/shared/` | Zod schemas, tool registry types, prompt templates        | —    |
 | `prisma/`          | Centralised `schema.prisma` + migrations                  | —    |
+| `evaluation/`      | Offline behavioural-fidelity pipeline — see [`evaluation/README.md`](evaluation/README.md) | — |
+| `scripts/`         | Dev and validation helpers (`test-mcp.sh`, dataset/scenario validators) | — |
+| `docs/`            | Internal documentation                                    | —    |
+| `claude-plugin/`   | Packaged Claude Code plugin (agents, hooks, skills)       | —    |
+
+### MCP Tools
+
+All tools are namespaced as `mcp__openormus__<name>` and defined in `mcp_server/src/registry/tools/`.
+
+**Character management**
+
+| Tool | Purpose |
+| ---- | ------- |
+| `character_create` | Save a new character profile to the database |
+| `character_list` | List all characters owned by the authenticated user |
+| `character_update` | Update fields on an existing character profile |
+| `character_delete` | Delete a character profile |
+| `character_find` | Fuzzy-search saved characters by name or trait |
+
+**Research**
+
+| Tool | Purpose |
+| ---- | ------- |
+| `character_research` | Online research on a character from a TV/film/book show |
+| `show_research` | Online research on a TV/film/book show |
+
+**Conversations**
+
+| Tool | Purpose |
+| ---- | ------- |
+| `conversation_start` | Start a background multi-character conversation job |
+| `conversation_job_status` | Poll the status and output of a running conversation job |
 
 ---
 
