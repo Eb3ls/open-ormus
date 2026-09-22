@@ -1,282 +1,150 @@
-# Evaluation Pipeline
+# Evaluation Pipeline Reference
 
-## Overview
+This reference describes the evaluation code as implemented. It complements [the operator guide](../evaluation/README.md).
 
-The evaluation measures whether an LLM playing fictional characters actually behaves like them. It runs three independent passes against pre-generated conversation datasets.
+## Execution model
 
-**Entry points:**
+Dataset generation is a prerequisite, and it makes external LLM API calls through the shared `generateTurn()` path:
+
 ```bash
-bun evaluation/generate_dataset.ts <config.yaml>   # generate conversations first
-bun evaluation/run_pipeline.ts <dataset-name>       # run all three passes in parallel
+bun evaluation/generate_dataset.ts <config.yaml>
 ```
 
-Results land in `$EVAL_RESULTS_PATH/<dataset>/<eval-XX>/`.
+The analysis launcher then creates the next available `eval-XX` directory and starts its three passes concurrently:
 
----
-
-## Phase 0 — Dataset Generation
-
-`generate_dataset.ts` reads `evaluation/configs/generate-dataset.yaml`, which defines runs across scenario/character pairings. For each run, it calls the LLM once per character turn using:
-
-- **System prompt:** `packages/shared/conversation/prompts/character-roleplay.hbs`
-- **Context:** full running conversation history
-
-Characters appear under **aliases** throughout — real names are never in the transcript. This alias masking is essential for the Judge Guessing pass to work.
-
-Each completed conversation is saved to `<dataset>/conversations/NNN.yaml` as a list of messages:
-```
-turn, character_id, character_name (alias), emotion, intensity, subtext, content
+```bash
+bun evaluation/run_pipeline.ts <dataset-name>
 ```
 
----
-
-## Phase 1 — Run Pipeline
-
-`run_pipeline.ts` fires all three passes via `Promise.allSettled()`. They share the same conversation files but make independent LLM calls and write to separate output directories. All three run concurrently.
-
----
-
-## Pass 1 — Judge Guessing (`evaluation/judge/`)
-
-**Question:** Given only aliases, can a judge LLM correctly match each alias to its real character?
-
-### Input
-- All conversation YAMLs (alias-masked transcripts)
-- `evaluation/dataset/characters.yaml` — character profiles
-
-### Steps per conversation
-
-1. Extract the aliases used in the conversation
-2. Shuffle character profiles **deterministically** (seeded by scenario ID — prevents position bias, ensures reproducibility)
-3. For each of up to 3 judge models:
-   - Render `judge/prompts/system.hbs` — behavioral matching instructions with a 3-tier evidence hierarchy: exact language → speech signature → value in action
-   - Render `judge/prompts/user.hbs` — scenario context, full transcript, shuffled profiles, real names list, aliases to assign
-   - Call LLM → parse JSON → validate against `JudgeOutputSchema` (Zod)
-   - Mark each `alias → real_name` assignment correct or incorrect
-
-### Output
-`eval-XX/judge_guessing/guessing_result.yaml` — per-scenario array with each judge's assignments and an `all_correct` boolean.
-
----
-
-## Pass 2 — Reconstruct Persona (`evaluation/reconstruct/`)
-
-**Question:** Can a reconstructor LLM infer a character's profile from what they say in a segment? Does fidelity degrade across segments?
-
-### Input
-Same conversation files, segmented into N equal-length windows by `evaluation/shared/segmenter.ts`.
-
-### Step A — Reconstruct
-
-Render `reconstructor-system.hbs` + `reconstructor-user.hbs` (alias, scenario, segment transcript, field definitions). Call LLM → get per-field inferred items.
-
-For each of the 6 fields (`personalityTraits`, `speechPatterns`, `values`, `fears`, `goals`, `copingStyle`) the reconstructor returns either:
-
-```json
-{ "not_observed": false, "items": ["channels fear into immediate action", "..."] }
-```
-or, if the transcript contains no evidence for that field:
-```json
-{ "not_observed": true, "items": [] }
+```text
+generate_dataset.ts
+        |
+        v
+<dataset>/conversations/*.yaml
+        |
+        +---- Promise.allSettled() ----> judge_guessing
+        +------------------------------> reconstruct_persona
+        +------------------------------> context_drift
 ```
 
-**`not_observed` is not a failure.** It means the story simply didn't show that trait in this segment. `not_observed: true` segments are **excluded from every average and slope calculation** — they do not penalise the score. The system prompt is explicit: *"not_observed means the evidence is absent — not that the character lacks this trait. Use it freely."*
+The analysis passes are independent consumers of the conversation files. `Promise.allSettled()` lets the launcher retain successful output when another analysis fails. It does not make generation concurrent with analysis.
 
-If the reconstructor emits items with `not_observed: false` but those items have no textual basis, the comparator will score them down.
+All entry points require `EVAL_RESULTS_PATH`, `LLM_API_KEY`, and `LLM_BASE_URL`. The result root has no fallback path. Although the harness runs without the application database or authentication services, it invokes the configured LLM provider and therefore is not an offline network workflow.
 
-### Step B — Compare
+The individual commands read `eval_name` from their YAML config; it is not a supported positional argument:
 
-For each field, for each comparator model:
-- Render `comparator-system.hbs` + `comparator-user.hbs` (field name, ground-truth items, reconstructed items)
-- Call LLM → each reconstructed item is scored:
-
-| Label | Score |
-|---|---|
-| `match` | +1 |
-| `no_match` | 0 |
-| `contradiction` | −1 |
-
-Multiple comparator models vote per item; **strict majority** (> 50%) wins. Ties default to `no_match` (0).
-
-`contradiction` (−1) is distinct from `no_match` (0): it signals the reconstructor actively hallucinated something that conflicts with the ground truth, rather than merely missing it.
-
-### Step C — Field score (precision / recall / F1)
-
-```
-precision = matched / observed_count        (penalises hallucination)
-recall    = matched / gt_count              (penalises omission)
-F1        = 2 × precision × recall / (precision + recall)
+```bash
+bun evaluation/judge_guessing.ts <config.yaml>
+bun evaluation/reconstruct_persona.ts <config.yaml>
+bun evaluation/context_drift.ts <config.yaml>
 ```
 
-`matched` = items scored +1 after majority vote. `contradiction` items lower precision (they are in `observed_count` but not `matched`) but do not directly enter the F1 formula — they are tracked separately in `contradicted`.
+`run_pipeline.ts` supplies its generated `eval-XX` name internally and overrides the default configs' `dataset_dir` with the command-line dataset argument.
 
-`not_observed: true` fields produce `f1: 0` in the raw struct but are **filtered out** before any mean or slope is computed.
+## Generation
 
-### Step D — Drift metrics (across segments)
+The generator validates `output_dir` as a simple directory name, requires at least one run, and verifies every scenario and character ID against the static YAML datasets. A run has at least two characters, `turns >= 1`, a resolved model, and either `ROUND_ROBIN` or `ORCHESTRATOR`; `ORCHESTRATOR` is rejected for two-character runs.
 
-- **`gt_divergence_slope`**: OLS linear regression of F1 scores across observed segments. A negative slope means fidelity drops as the conversation progresses. Computed only when ≥ 2 segments have non-null F1.
-- **`internal_consistency`**: F1 computed by treating the first-segment reconstructed items as "ground truth" and comparing against the last-segment items. Measures how much the character's expressed identity shifts end-to-end.
+For each configured run, `runConversation()` creates `turns * number_of_characters` messages. It passes the complete prior conversation to `generateTurn()` for every turn. The stored `ConversationResult` includes scenario metadata, alias names, model, scheduling strategy, timestamps, and the messages' emotion, intensity, subtext, reasoning, and content fields.
 
-(`evaluation/reconstruct/scoring.ts:computeSlope`, `computeFieldDriftScore`)
+Generation uses `Promise.all()` across configured runs, while turns within an individual conversation are generated serially. It writes to:
 
-### Output
-`eval-XX/reconstruct_persona/conversations/NNN.yaml` — per-character metrics per segment.
-`eval-XX/reconstruct_persona/summary.yaml` — dataset-level aggregates.
-
----
-
-## Pass 3 — Context Drift (`evaluation/drift/`)
-
-**Question:** Does the scenario stay on-topic and do characters stay in character as the conversation progresses?
-
-### Input
-Same conversation files, same segmentation.
-
-### Steps per segment
-
-1. Render `drift/prompts/system.hbs` + `drift/prompts/user.hbs`:
-   - System: engagement tier definitions, alignment tier definitions
-   - User: scenario metadata (stress axes, social context, pressure source, opening prompt), character profiles, prior messages as context, current segment
-2. For each of up to 3 judge models (in parallel via `Promise.allSettled()`): call LLM → get:
-   ```json
-   {
-     "scenario_engagement": "active" | "touched" | "absent",
-     "character_alignments": [
-       { "character_id": "...", "label": "consistent" | "neutral" | "contradicts" }
-     ]
-   }
-   ```
-3. **Majority vote** — strict majority (> 50%). Ties default to `touched` / `neutral`.
-
-### Label → score mapping
-
-| Label | Score |
-|---|---|
-| `active` / `consistent` | 1.0 |
-| `touched` / `neutral` | 0.5 |
-| `absent` / `contradicts` | 0.0 |
-
-**What the labels mean:**
-- **Engagement — `active`:** the scenario's core tension is clearly enacted. `touched`: theme is present but peripheral. `absent`: the scene has drifted away from the scenario premise.
-- **Alignment — `consistent`:** the character's behaviour reflects their documented personality. `neutral`: behaviour is plausible but uncharacteristic. `contradicts`: behaviour violates the character's core traits.
-
-### Drift calculation
-
-**Total drift = last segment score − first segment score.**
-
-Thresholds (hardcoded in `evaluation/shared/constants.ts`):
-
-| Range | Verdict |
-|---|---|
-| total < −0.25 | `degrading` |
-| total > +0.25 | `improving` |
-| −0.25 to +0.25 | `stable` |
-
-Examples (2 segments):
-
-| Segment 1 | Segment 2 | Delta | Verdict |
-|---|---|---|---|
-| `active` (1.0) | `absent` (0.0) | −1.0 | **degrading** |
-| `touched` (0.5) | `active` (1.0) | +0.5 | **improving** |
-| `active` (1.0) | `active` (1.0) | 0.0 | **stable** |
-| `active` (1.0) | `touched` (0.5) | −0.5 | **degrading** |
-
-With more than 2 segments, per-step deltas are stored, but the **verdict** is always based on total start-to-end movement (`last − first`). Intermediate steps are stored for inspection but do not affect the verdict.
-
-Verdict is computed independently for scenario engagement and for each character's alignment.
-
-(`evaluation/drift/scoring.ts:computeVerdict`, `computeDriftDeltas`)
-
-### Output
-`eval-XX/context_drift/conversation_results.yaml`
-`eval-XX/context_drift/summary.yaml`
-
----
-
-## Shared LLM Call (`evaluation/shared/call.ts`)
-
-Every pass funnels through `callWithRetry<T>()`:
-
-1. `new OpenAI({ baseURL: LLM_BASE_URL + "/v1", apiKey: LLM_API_KEY })`
-2. `client.chat.completions.create()` with:
-   - `stream: true`, `stream_options: { include_usage: true }`
-   - `temperature: 0`
-   - `response_format: { type: "json_object" }`
-   - `extra_headers: { "HTTP-Referer": "https://openormus.app", "X-Title": "OpenOrmus" }`
-3. Collect streamed chunks; extract usage (`inputTokens`, `outputTokens`, `reasoningTokens`, `cachedTokens`) and the `x-generation-id` header
-4. Parse the accumulated string as JSON, validate against the pass-specific Zod schema
-5. On failure (JSON parse error, empty response, schema mismatch): retry up to 3 times with detailed error context appended
-6. Return `{ result: T, usage: RawUsageMeta }`
-
-Usage is immediately handed to `CostTracker.record()`, keyed by `conversationId + segmentIdx + role`. After each pass completes, `tracker.flush()` writes `eval-XX/costs/<pass>.yaml`.
-
----
-
-## Output Directory Structure
-
-```
-$EVAL_RESULTS_PATH/
-└── <dataset>/
-    ├── conversations/
-    │   └── NNN.yaml               alias-masked ConversationResult
-    └── eval-XX/
-        ├── judge_guessing/
-        │   └── guessing_result.yaml
-        ├── reconstruct_persona/
-        │   ├── conversations/
-        │   │   └── NNN.yaml       ConversationReconstructionResult
-        │   └── summary.yaml
-        ├── context_drift/
-        │   ├── conversation_results.yaml
-        │   └── summary.yaml
-        └── costs/
-            ├── judge_guessing.yaml
-            ├── reconstruct_persona.yaml
-            └── context_drift.yaml
+```text
+$EVAL_RESULTS_PATH/<output_dir>/
+├── meta.yaml
+├── generate-config.yaml
+├── conversations/NNN.yaml
+└── costs/generation.yaml
 ```
 
----
+There is no refusal check for an existing `<output_dir>`. Existing metadata, config, and same-numbered conversations can be overwritten. If any run fails after its retries, the generator recursively removes the entire dataset directory, including any pre-existing material under that name. Treat each output directory as new and disposable while generating; copy complete results before rerunning a name.
 
-## Call Sequence
+The aliases are assigned deterministically from a fixed pool in input character order. The fictional Vethara setting and aliases reduce obvious identity leakage, but cannot establish that a model or provider has no related training-data knowledge.
 
+## Judge Guessing
+
+`runJudgingPass()` loads every conversation YAML and processes conversations in parallel. For one conversation it reconstructs the alias-to-real-name map from character IDs, gives only aliases in the transcript, and supplies the participating dataset profiles to each configured judge. Profile display order is deterministically shuffled from the scenario ID. The judge models run in parallel.
+
+Each output entry has `scenario_id`, `scenario_title`, and one record per judge containing the model, individual alias assignments, evidence strings, and `all_correct`. The config permits one through three judges. The pass writes:
+
+```text
+$EVAL_RESULTS_PATH/<dataset>/eval-XX/judge_guessing/
+├── config.yaml
+└── guessing_result.yaml
 ```
-bun evaluation/run_pipeline.ts dataset-v2
-    │
-    └─ Promise.allSettled([
-         ┌─ runJudgingPass() ──────────────────────────────────────┐
-         │  per conversation:                                       │
-         │    shuffle profiles (seeded by scenario_id)             │
-         │    per judge model:                                      │
-         │      render system.hbs + user.hbs                       │
-         │      callWithRetry() → parse JudgeOutputSchema          │
-         │      score alias→real_name assignments                  │
-         │  writeGuessingResult()  ·  tracker.flush()              │
-         └─────────────────────────────────────────────────────────┘
-         ┌─ runReconstructionPass() ───────────────────────────────┐
-         │  per conversation:                                       │
-         │    segmentConversation(messages, N)                      │
-         │    per character:                                        │
-         │      per segment:                                        │
-         │        callWithRetry() → parse ReconstructorOutput      │
-         │        per field:                                        │
-         │          per comparator model:                           │
-         │            callWithRetry() → parse ComparatorOutput     │
-         │          majority vote → match/no_match/contradiction    │
-         │          computeFieldScore() → precision/recall/F1      │
-         │      computeFieldDriftScore() → slope, consistency      │
-         │  writeReconstructResults()  ·  tracker.flush()          │
-         └─────────────────────────────────────────────────────────┘
-         ┌─ runDriftPass() ────────────────────────────────────────┐
-         │  per conversation:                                       │
-         │    segmentConversation(messages, N)                      │
-         │    per segment:                                          │
-         │      render system.hbs + user.hbs                       │
-         │      per judge model (parallel):                         │
-         │        callWithRetry() → parse DriftJudgeOutput         │
-         │      majorityVoteEngagement() → active/touched/absent   │
-         │      majorityVoteAlignment()  → consistent/neutral/…    │
-         │    computeDriftDeltas() → last−first → verdict          │
-         │  writeConversationResults()  ·  tracker.flush()         │
-         └─────────────────────────────────────────────────────────┘
-       ])
+
+No code computes `inter_judge_agreement`, aggregate accuracy, or another summary artifact for this pass. Those are analyses of `guessing_result.yaml`, not fields emitted by the current harness.
+
+## Persona Reconstruction
+
+`runReconstructionPass()` skips conversation files that have no messages, then processes the remaining conversations in parallel. A reconstructable conversation must contain at least `2 * segments` messages. `segments` defaults to 1; `segmentConversation()` uses `min(segments, message_count)`, equal-size floor divisions, and puts any remainder in the final segment.
+
+For every character and segment, the reconstructor receives the alias, scenario, and transcript segment, without the ground-truth sheet. For every requested field, each comparator receives the reconstructed items and the corresponding sheet items. Characters, segments, and comparator calls use `Promise.all()` at their respective levels.
+
+The default profile fields are:
+
+```text
+personalityTraits, speechPatterns, values, fears, goals, copingStyle
+```
+
+Comparator labels become numeric item scores: `match` = 1, `no_match` = 0, and `contradiction` = -1. An item needs a strict majority of configured comparators for 1 or -1; all other cases score 0. Missing comparator item scores also default to `no_match`.
+
+`not_observed` or an empty reconstructed item list yields a raw zero F1 and an empty item list, but those fields are excluded from aggregate means and ground-truth F1 slopes. For observed fields, precision is `matched / observed_count`, recall is `matched / gt_count`, and F1 is their harmonic mean. A field's `contradicted` count is retained in its per-segment record; it is not an aggregate `contradiction_rate`.
+
+For fields with enough observed segment F1s, `gt_divergence_slope` is an OLS slope over their original segment indices. The optional `internal_consistency` comparison scores final-segment reconstructed items against first-segment reconstructed items when both have observations. The summary contains field, difficulty, and character-tier aggregates, `mean_inter_comparator_agreement`, and the ten most negative mean slopes.
+
+The implementation has no special similar-pair comparison path. In particular, it does not run or write A-on-A, B-on-B, A-on-B, and B-on-A comparisons of a pair's `varyingAxis`, and it does not emit pair-differentiation verdicts.
+
+Output:
+
+```text
+$EVAL_RESULTS_PATH/<dataset>/eval-XX/reconstruct_persona/
+├── config.yaml
+├── conversations/NNN.yaml
+└── summary.yaml
+```
+
+## Context Drift
+
+`runDriftPass()` requires `segments >= 2`. It skips empty conversations and conversations with fewer messages than requested segments, then processes the others in parallel. It exposes real character records, the scenario metadata, prior transcript context, and the current segment to each judge. The judges for a segment are launched with `Promise.allSettled()`; the config accepts one or more judges.
+
+Successful judges vote on scenario engagement (`active`, `touched`, `absent`) and each character's alignment (`consistent`, `neutral`, `contradicts`). A strict majority selects the stored label. Otherwise the label is `touched` or `neutral`. The stored numeric score is the mean score of valid votes: 1.0, 0.5, or 0.0 respectively. A segment has `low_confidence: true` when fewer than two judges succeed, and a segment where all judges fail aborts the conversation and pass.
+
+For each conversation, `total` drift is last numeric segment score minus first score. The code marks it `degrading` below `-0.25`, `improving` above `0.25`, and `stable` otherwise. The pass records adjacent deltas as well as engagement and alignment totals. Its scenario summary provides per-segment engagement counts and mean scores, mean drift per delta, total engagement and alignment drift, and per-character mean total drift.
+
+Output:
+
+```text
+$EVAL_RESULTS_PATH/<dataset>/eval-XX/context_drift/
+├── config.yaml
+├── conversation_results.yaml
+└── summary.yaml
+```
+
+## API calls, costs, and failure behavior
+
+Analysis LLM calls use streamed chat completions at temperature zero, request JSON-object responses, validate parsed output with pass-specific Zod schemas, and retry up to three attempts. Generation has a separate three-attempt retry loop per configured conversation run. These are provider API calls, not local-only computations.
+
+Each successful call that returns usage metadata is recorded in `costs/<pass>.yaml`. For OpenRouter base URLs, the harness also tries to retrieve cost values by generation ID; failure to retrieve cost information is logged but does not fail an otherwise successful pass.
+
+Before processing, each analysis pass refuses an existing own output directory (`judge_guessing`, `reconstruct_persona`, or `context_drift`) for the selected `eval_name`. After a failure, the affected pass removes its incomplete directory. `run_pipeline.ts` removes the entire `eval-XX` directory only when all three concurrent passes fail; otherwise it preserves completed outputs.
+
+The complete result layout is:
+
+```text
+$EVAL_RESULTS_PATH/<dataset>/
+├── meta.yaml
+├── generate-config.yaml
+├── conversations/
+├── costs/
+│   └── generation.yaml
+└── eval-XX/
+    ├── meta.yaml
+    ├── costs/
+    │   ├── judge_guessing.yaml
+    │   ├── reconstruct_persona.yaml
+    │   └── context_drift.yaml
+    ├── judge_guessing/
+    ├── reconstruct_persona/
+    └── context_drift/
 ```

@@ -1,4 +1,14 @@
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, mock } from "bun:test";
+
+let authenticatedUser: { id: string } | null = null;
+mock.module("@/lib/supabase/server", () => ({
+  createClient: async () => ({
+    auth: {
+      getUser: async () => ({ data: { user: authenticatedUser }, error: null }),
+    },
+  }),
+}));
+
 import { GET } from "./route";
 import { NextRequest } from "next/server";
 
@@ -55,5 +65,17 @@ describe("GET /api/oauth/authorize", () => {
     const { state, ...rest } = validParams;
     const res = await GET(makeRequest(rest));
     expect(res.status).toBe(307);
+  });
+
+  test("skips login for an authenticated user and preserves the PKCE cookie", async () => {
+    authenticatedUser = { id: "test-user" };
+    try {
+      const res = await GET(makeRequest(validParams));
+      expect(res.status).toBe(307);
+      expect(res.headers.get("location")).toBe("http://localhost:3000/api/oauth/callback");
+      expect(res.headers.get("set-cookie") ?? "").toContain("__oauth_pkce");
+    } finally {
+      authenticatedUser = null;
+    }
   });
 });

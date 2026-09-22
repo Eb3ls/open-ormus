@@ -1,271 +1,136 @@
 # Evaluation Pipeline
 
-The evaluation pipeline measures **LLM behavioural fidelity end-to-end**: given a character profile, does the production `generateTurn()` function preserve personality signal through the full chain of `profile → generation → behaviour → analysis`?
+The evaluation harness tests whether the shared `generateTurn()` implementation carries information from a fictional character sheet into generated dialogue, then evaluates the saved transcripts from three perspectives: alias-to-profile guessing, persona reconstruction, and context drift.
 
-It runs entirely offline. No database, no auth. You need only `LLM_API_KEY` and `LLM_BASE_URL` in your `.env`.
+The harness does not require the application's database or authentication services, but it is not offline in the network sense: every generation and analysis pass calls the configured OpenAI-compatible LLM API. Set all three required environment variables before running it:
 
----
+```bash
+export EVAL_RESULTS_PATH=/absolute/path/for/evaluation-results
+export LLM_API_KEY=...
+export LLM_BASE_URL=https://provider.example/api/v1
+```
+
+`EVAL_RESULTS_PATH` is the result-root source of truth. The scripts do not default to `evaluation/results/`; they fail when it is unset. `LLM_BASE_URL` may include a trailing `/v1`, which the scripts normalize before constructing the client.
 
 ## Dataset
 
-The dataset lives in `evaluation/dataset/` and is **static** — it defines the ground truth.
+`evaluation/dataset/characters.yaml` contains 16 fictional character records, and `evaluation/dataset/scenarios.yaml` contains 32 social scenarios. The characters include eight distinctive archetypes (`char_001`–`char_008`) and four deliberately similar pairs (`char_009`–`char_016`):
 
-| File              | Contents                                                   |
-| ----------------- | ---------------------------------------------------------- |
-| `characters.yaml` | 16 fictional characters across two tiers                   |
-| `scenarios.yaml`  | 32 social scenarios with stress axes and difficulty levels |
+| Pair | IDs | Declared `varyingAxis` |
+| --- | --- | --- |
+| Officials | `char_009` / `char_010` | `speechPatterns` |
+| Survivors | `char_011` / `char_012` | `copingStyle` |
+| Reformers | `char_013` / `char_014` | `fears` |
+| Caregivers | `char_015` / `char_016` | `goals` |
 
-### Characters
+The Vethara setting and fictional names reduce the chance of a direct match to well-known real-world characters. They do not demonstrate that the models or providers have no related training-data contamination, so results should not be interpreted as a contamination guarantee.
 
-**Tier 1 — 8 Distinctive Archetypes** (char_001–008): placed on a 2D grid of moral axis × agency axis. Each occupies a unique coordinate (e.g. Rebel = Idealist × High Agency, Fatalist = Cynic × Low Agency). Maximally separated in personality space.
+Each configured generation run chooses a scenario, two or more characters, a model, a number of turns per character, and either `ROUND_ROBIN` or `ORCHESTRATOR` scheduling. `ORCHESTRATOR` is invalid for exactly two characters. The generator assigns aliases from its fixed alias pool in participant order, so the transcript records aliases rather than the dataset characters' real names.
 
-**Tier 2 — 4 Similar Pairs** (char_009–016): each pair shares every field except one `varyingAxis`. These are the benchmark's sharpest test — a model that collapses to average behaviour fails to distinguish pair members on their single axis of difference.
+## Run a dataset and its analyses
 
-| Pair       | IDs                 | varyingAxis    |
-| ---------- | ------------------- | -------------- |
-| Officials  | char_009 / char_010 | speechPatterns |
-| Survivors  | char_011 / char_012 | copingStyle    |
-| Reformers  | char_013 / char_014 | fears          |
-| Caregivers | char_015 / char_016 | goals          |
-
-All characters are set in **Vethara**, a fictional island city-state. The fictional setting eliminates LLM training-data contamination.
-
-### Scenarios
-
-32 scenarios across three difficulty levels (`baseline`, `moderate`, `high`) and multiple stress axes (e.g. `power consolidation vs fairness`, `obedience vs conscience`). Each scenario has a `social_context` and a `pressure_source` tag, and a list of `stress_axes` that pair-differentiation analysis uses to determine whether a scenario is likely to activate a pair's `varyingAxis`.
-
----
-
-## Pipeline
-
-The four passes run in sequence. Each pass reads the output of the previous one.
-
-```
-generate_dataset.ts  →  judge_guessing.ts  →  reconstruct_persona.ts  →  context_drift.ts
-       ↓                      ↓                        ↓                        ↓
-  conversations/          judge_guessing/        reconstruct_persona/       context_drift/
-```
-
-All passes use `Promise.all` — conversations are processed in parallel within each pass.
-
-**Step 1 — Generate the dataset:**
+First generate the reusable transcript corpus:
 
 ```bash
 bun evaluation/generate_dataset.ts evaluation/configs/generate-dataset.yaml
 ```
 
-**Step 2 — Run all evaluation passes:**
+The generate config requires `output_dir` and at least one run. Each run needs `scenario`, at least two `characters`, a positive integer `turns`, and `turn_strategy`; its `model` may inherit from `default_model`.
+
+Generation writes directly below `$EVAL_RESULTS_PATH/<output_dir>/`. It creates the directory if necessary and writes fixed conversation filenames such as `conversations/001.yaml`. It does not refuse an existing dataset name, so reusing one can replace metadata, config, and same-numbered conversation files. If generation ultimately fails, the generator removes its entire dataset directory. Use a new or disposable `output_dir` and preserve completed datasets elsewhere before regenerating.
+
+Then run all three analysis passes against that dataset:
 
 ```bash
 bun evaluation/run_pipeline.ts <dataset-name>
 ```
 
-The pipeline scans `EVAL_RESULTS_PATH/<dataset-name>/` for the first `eval-XX` directory and runs judge → reconstruct → drift on it.
+`run_pipeline.ts` requires `$EVAL_RESULTS_PATH/<dataset-name>/conversations/` to exist. It finds the next unused `eval-XX` name under that dataset, then starts Judge Guessing, Persona Reconstruction, and Context Drift concurrently with `Promise.allSettled()`. The passes read the same saved conversations, make separate API calls, and write different output subdirectories. Generation must finish first; the analyses do not depend on one another's results.
 
-Individual passes can also be run separately. Each pass reads `eval_name` from its YAML config — see the Config Reference below.
-
----
-
-### Pass 1 — Generate Dataset
-
-**Entry point:** `evaluation/generate_dataset.ts`
-**What it measures:** nothing — it generates the conversation corpus that the other passes evaluate.
-
-Calls the production `generateTurn()` function for each configured run (character × scenario pairing). Output is a set of conversation YAML files in `evaluation/results/<output_dir>/conversations/`.
-
-**Command:**
+For an individual analysis pass, put `eval_name` in that pass's YAML config and run the command with only the config path:
 
 ```bash
-bun evaluation/generate_dataset.ts evaluation/configs/generate-dataset.yaml
+bun evaluation/judge_guessing.ts evaluation/configs/judge-guessing.yaml
+bun evaluation/reconstruct_persona.ts evaluation/configs/reconstruct-persona.yaml
+bun evaluation/context_drift.ts evaluation/configs/context-drift.yaml
 ```
 
-**Key config fields:**
+The positional `eval-name` form is not supported by these entry points. A direct pass takes its `dataset_dir` and `eval_name` from the YAML config. Each pass refuses to start if its own output directory already exists, rather than overwriting it.
 
-```yaml
-output_dir: "dataset-v1" # name of the dataset; passed as dataset_dir to passes 2–4
-default_model:
-  "..." # generation model — use a capable, instruction-following model;
-  # this is the most quality-sensitive step in the pipeline
-runs:
-  - scenario: scenario_020
-    characters: [char_001, char_007]
-    turns: 4
-    turn_strategy: ROUND_ROBIN # or ORCHESTRATOR (≥3 characters)
+## What each analysis reports
+
+### Judge Guessing
+
+Judge Guessing asks whether a judge can map the aliases in a transcript to the participating character profiles. For each conversation, the profiles are shuffled deterministically using the scenario ID, then every configured judge independently returns alias-to-real-name assignments and evidence. The output records each assignment's `correct` flag and the judge's `all_correct` flag.
+
+The config accepts one to three judge models. Results are stored at:
+
+```text
+$EVAL_RESULTS_PATH/<dataset>/eval-XX/judge_guessing/guessing_result.yaml
 ```
 
-**Output:** `evaluation/results/<output_dir>/conversations/001.yaml`, `002.yaml`, …
+There is no calculated `inter_judge_agreement` field or dataset-level accuracy summary in this output. Consumers that need those metrics must calculate them from the recorded per-judge assignments.
 
----
+### Persona Reconstruction
 
-### Pass 2 — Judge / Guessing
+Persona Reconstruction asks a reconstructor to infer observable profile items from each character's transcript segment. Comparator models then label each inferred item against the dataset sheet as `match`, `no_match`, or `contradiction`; a strict majority determines the item score, with ties becoming `no_match`.
 
-**Entry point:** `evaluation/judge_guessing.ts`
-**What it measures:** **distinguishability** — can a judge LLM tell which alias maps to which character from the transcript alone? Characters are anonymised to random aliases before the judge sees them.
+By default it evaluates six fields: `personalityTraits`, `speechPatterns`, `values`, `fears`, `goals`, and `copingStyle`. The `fields` config option can restrict that set. `segments` defaults to `1`; a conversation must contain at least twice as many messages as requested segments. Segmentation uses consecutive message windows, putting any remainder in the final window.
 
-A panel of 1–3 judge models reads each conversation and guesses the alias → character mapping. Agreement across models is reported as `inter_judge_agreement`. Low accuracy means characters are not sufficiently distinct in their generated behaviour.
+For a non-`not_observed` field, the writer records precision, recall, F1, count of contradicted items, item-level comparator votes, and comparator agreement. Fields marked `not_observed` have a raw F1 of zero but are excluded from summary means and F1-slope calculations. With two or more observed segments, it also reports a ground-truth F1 slope and an endpoint internal-consistency comparison.
 
-**Command:**
+Results are written to:
 
-```bash
-bun evaluation/judge_guessing.ts evaluation/configs/judge-guessing.yaml [eval-name]
+```text
+$EVAL_RESULTS_PATH/<dataset>/eval-XX/reconstruct_persona/
+├── config.yaml
+├── conversations/<NNN>.yaml
+└── summary.yaml
 ```
 
-`eval-name` is an optional second argument that identifies which evaluation run to write into (defaults to `"eval-01"`). It must match the `eval-name` used when the dataset was generated.
+The current summary includes mean field F1, drift and consistency aggregates, difficulty and tier groupings, and `mean_inter_comparator_agreement`. It does not produce a top-level `contradiction_rate`, a pair-differentiation result, or four directional comparisons of a pair's `varyingAxis`. Similar pairs can still be inspected through their ordinary per-character records, but those additional metrics are not implemented outputs.
 
-**Key config fields:**
+### Context Drift
 
-```yaml
-dataset_dir: "dataset-v1"
-judges:
-  - model: "..." # use a diverse panel — models from different families reduce correlated errors;
-  - model: "..." # each judge reads the same transcript independently
-  - model: "..."
+Context Drift gives its judge models the scenario, character records, prior messages, and the current segment. It asks for scenario engagement (`active`, `touched`, or `absent`) and per-character alignment (`consistent`, `neutral`, or `contradicts`). It accepts one or more judges and requires `segments >= 2`; conversations with fewer messages than requested segments are skipped.
+
+Labels map to scores of 1.0, 0.5, and 0.0. The reported label requires a strict majority; when no label has one, it falls back to `touched` or `neutral`. The reported numeric score is the mean of the successful judges' label scores. A segment is marked low confidence when fewer than two judges return successfully. The pass fails if every judge fails for a segment.
+
+Drift is last segment score minus first segment score. Totals below `-0.25` are `degrading`, above `0.25` are `improving`, and the remainder are `stable`. The output includes per-conversation segment scores and deltas plus a summary grouped by scenario:
+
+```text
+$EVAL_RESULTS_PATH/<dataset>/eval-XX/context_drift/
+├── config.yaml
+├── conversation_results.yaml
+└── summary.yaml
 ```
 
-**Output:** `evaluation/results/<dataset_dir>/<eval-name>/judge_guessing/guessing_result.yaml`
+## Output layout and retention
 
----
+After a successful generation and complete analysis run, the relevant directory shape is:
 
-### Pass 3 — Persona Reconstruction (+ optional Drift)
-
-**Entry point:** `evaluation/reconstruct_persona.ts`
-**What it measures:** **fidelity** — how much personality signal survives generation. A reconstructor LLM infers the character's profile from the transcript (blind — no ground truth shown). A comparator panel scores each reconstructed item against the ground-truth profile.
-
-**Primary metric:** `contradiction_rate` — not how much was recovered, but how much actively contradicts the profile. Low recall can mean the scenario didn't activate a trait (expected). Active contradiction means the model broke character.
-
-**Six fields in scope:** `personalityTraits`, `speechPatterns`, `values`, `fears`, `goals`, `copingStyle`. Fields like `notableQuotes` and `backstory` are excluded (not reliably observable in short conversations).
-
-**Pair differentiation:** for similar-pair conversations, the comparator runs in 4 directions on the `varyingAxis` field (A-on-A, B-on-B, A-on-B, B-on-A). A pair is _differentiated_ when diagonal scores > 0.5 and cross scores < 0.5.
-
-**Drift mode:** set `segments: N` (N ≥ 2) to split each conversation into N time windows and reconstruct each window independently. This surfaces temporal drift — whether a character's fidelity holds, degrades, or recovers over the conversation. Without `segments`, the full transcript is used (equivalent to `segments: 1`).
-
-**Command:**
-
-```bash
-bun evaluation/reconstruct_persona.ts evaluation/configs/reconstruct-persona.yaml [eval-name]
+```text
+$EVAL_RESULTS_PATH/
+└── <dataset>/
+    ├── meta.yaml
+    ├── generate-config.yaml
+    ├── conversations/
+    │   └── NNN.yaml
+    ├── costs/
+    │   └── generation.yaml
+    └── eval-XX/
+        ├── meta.yaml
+        ├── costs/
+        │   ├── judge_guessing.yaml
+        │   ├── reconstruct_persona.yaml
+        │   └── context_drift.yaml
+        ├── judge_guessing/
+        ├── reconstruct_persona/
+        └── context_drift/
 ```
 
-`eval-name` is an optional second argument (defaults to `"eval-01"`). Must match the run to evaluate.
+The three passes copy their configs into their own subdirectories and update `eval-XX/meta.yaml`. Cost files contain the available usage metadata; when the base URL contains `openrouter.ai`, the harness additionally attempts to fetch costs. Cost-fetch failures are reported but do not fail a completed pass.
 
-**Key config fields:**
+On a failure inside an analysis pass, that pass removes its incomplete output directory. `run_pipeline.ts` preserves a partially completed `eval-XX` directory when at least one concurrent pass succeeds; if all three fail, it removes the `eval-XX` directory. This cleanup and the generation behavior above make result-directory backups important for experimental provenance.
 
-```yaml
-dataset_dir: "dataset-v1"
-reconstructor:
-  model: "..." # strong reasoning/summarisation model — infers personality from transcript alone
-comparators:
-  - model: "..." # use a different family from the reconstructor to avoid self-grading bias
-  - model: "..."
-# segments: optional — splits each transcript into N time windows for temporal drift detection;
-#           omit for full-transcript mode
-# fields: optional — defaults to all 6 behavioural fields
-```
-
-**Output:** `evaluation/results/<dataset_dir>/<eval-name>/reconstruct_persona/`
-
-- `conversations/` — per-conversation result files
-- `summary.yaml` — aggregated metrics by field, difficulty, tier, and pair
-
----
-
-### Pass 4 — Context Drift
-
-**Entry point:** `evaluation/context_drift.ts`
-**What it measures:** **scenario engagement** — did the scenario successfully activate its intended stress axes over the conversation, and did each character respond to that pressure in a personality-consistent way? Tracked across configurable time segments to detect engagement drift.
-
-This is **complementary to Pass 3**, not redundant. Pass 3 is scenario-blind (judges don't know what scenario the character was in). Pass 4 is scenario-aware (judges explicitly evaluate whether the scenario's pressure was felt and responded to correctly).
-
-|                          | Pass 3 — Reconstruct        | Pass 4 — Context Drift             |
-| ------------------------ | --------------------------- | ---------------------------------- |
-| Scenario known to judge? | No                          | Yes                                |
-| Character sheets known?  | No                          | Yes                                |
-| Measures                 | Trait expression            | Scenario-triggered behaviour       |
-| Output                   | F1 per field                | Engagement + alignment per segment |
-| Diagnostic value         | Character prompting quality | Scenario design quality            |
-
-Cross-referencing both passes:
-
-| Pass 3 ↓ \ Pass 4 → | High engagement                       | Low engagement                        |
-| ------------------- | ------------------------------------- | ------------------------------------- |
-| **High fidelity**   | Traits expressed AND scenario engaged | Traits expressed but scenario ignored |
-| **Low fidelity**    | Scenario engaged but personality weak | Both failed                           |
-
-**Primary metric:** `total_drift` per scenario — difference between first and last segment score. Negative = scenario lost grip; zero = flat disengagement; positive = engagement built over time.
-
-**Command:**
-
-```bash
-bun evaluation/context_drift.ts evaluation/configs/context-drift.yaml [eval-name]
-```
-
-`eval-name` is an optional second argument (defaults to `"eval-01"`). Must match the run to evaluate.
-
-**Key config fields:**
-
-```yaml
-dataset_dir: "dataset-v1"
-# segments: number of time windows to split each conversation into (must be ≥ 2);
-#           more segments = finer drift granularity, higher cost
-judges:
-  - model: "..." # diverse panel, same guidance as Pass 2
-  - model: "..."
-  - model: "..."
-```
-
-**Output:** `evaluation/results/<dataset_dir>/<eval-name>/context_drift/`
-
----
-
-## Results Directory Layout
-
-```
-evaluation/results/
-└── dataset-v1/                    ← output_dir from generate config (= dataset_dir for passes 2–4)
-    └── eval-01/                   ← auto-assigned by generate (eval-01, eval-02, …)
-        │                            pass as second CLI arg to passes 2–4 to target this run
-        ├── meta.yaml              ← created by generate, updated by each subsequent pass
-        ├── generate-config.yaml   ← copy of the generate config
-        ├── conversations/         ← written by generate
-        │   ├── 001.yaml
-        │   ├── 002.yaml
-        │   └── ...
-        ├── judge_guessing/        ← written by pass 2
-        │   ├── config.yaml
-        │   └── guessing_result.yaml
-        ├── reconstruct_persona/   ← written by pass 3
-        │   ├── config.yaml
-        │   ├── conversations/
-        │   │   ├── 001.yaml
-        │   │   └── ...
-        │   └── summary.yaml
-        └── context_drift/         ← written by pass 4
-            ├── config.yaml
-            ├── conversation_results.yaml
-            └── summary.yaml
-```
-
-The generate step auto-increments `eval-name` (eval-01, eval-02, …) so it never overwrites an existing run. Passes 2–4 fail if their output subdirectory already exists — delete it or use a different `eval-name`.
-
----
-
-## Environment Variables
-
-| Variable       | Required   | Description                                        |
-| -------------- | ---------- | -------------------------------------------------- |
-| `LLM_API_KEY`  | All passes | API key for the LLM provider                       |
-| `LLM_BASE_URL` | All passes | Provider URL (e.g. `https://openrouter.ai/api/v1`) |
-
-Both are read from `.env.local` at project root (Bun loads it automatically). Neither appears in config YAML files.
-
----
-
-## Config Reference
-
-| Entry point                                                  | Config(s)                  | Description                    |
-| ------------------------------------------------------------ | -------------------------- | ------------------------------ |
-| `bun evaluation/run_pipeline.ts`                             | all four (defaults)        | Runs all passes in sequence    |
-| `bun evaluation/generate_dataset.ts <config>`                | `generate-dataset.yaml`    | Generate conversations         |
-| `bun evaluation/judge_guessing.ts <config> [eval-name]`      | `judge-guessing.yaml`      | Judge guessing pass            |
-| `bun evaluation/reconstruct_persona.ts <config> [eval-name]` | `reconstruct-persona.yaml` | Reconstruction pass            |
-| `bun evaluation/reconstruct_persona.ts <config> [eval-name]` | `drift-check.yaml`         | Reconstruction in segment mode |
-| `bun evaluation/context_drift.ts <config> [eval-name]`       | `context-drift.yaml`       | Context drift pass             |
+For implementation-level details, see [the evaluation pipeline reference](../docs/evaluation-pipeline.md).

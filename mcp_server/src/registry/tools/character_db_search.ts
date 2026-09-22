@@ -6,6 +6,7 @@ import {
   CharacterSearchResultSchema,
   TOOL_DESCRIPTIONS,
   type CharacterDbSearchInput,
+  type CharacterPicture,
   type SavedCharacterRecord,
 } from "@open-ormus/shared";
 import { prisma } from "../../db.js";
@@ -57,11 +58,23 @@ export async function characterDbSearchHandler(
     LIMIT ${Prisma.raw(String(limit))}
   `);
 
+  if (rows.length === 0) return [];
+  const pictures = await prisma.characterPicture.findMany({
+    where: { userId, characterId: { in: rows.map((row) => row.id) } },
+  });
+  const picturesByCharacter = new Map<string, CharacterPicture[]>();
+  for (const picture of pictures) {
+    const entries = picturesByCharacter.get(picture.characterId) ?? [];
+    entries.push({ size: picture.size, url: picture.url });
+    picturesByCharacter.set(picture.characterId, entries);
+  }
+
   return rows.map((row) => ({
     id: row.id,
     userId: row.userId,
     name: row.name,
     sheet: CharacterSearchResultSchema.parse(row.sheet),
+    pictures: picturesByCharacter.get(row.id) ?? [],
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     archivedAt: row.archivedAt?.toISOString() ?? null,
