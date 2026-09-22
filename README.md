@@ -8,7 +8,7 @@ The core design is a **single tool registry** consumed by three channels simulta
 - **AI assistant** — internal OpenAI SDK chat loop with tool access
 - **MCP server** — external Model Context Protocol endpoint for agent clients
 
-Two tracks: production chat (live SSE streaming) and evaluation (offline batch with a separate judge model).
+Two tracks: production chat (live SSE streaming) and evaluation (batch processing with separate evaluator models). Evaluation runs independently of the app and database, but still calls the configured LLM provider.
 
 ---
 
@@ -17,7 +17,7 @@ Two tracks: production chat (live SSE streaming) and evaluation (offline batch w
 - **AI character assistant** (`/chat`) — conversational agent that creates, edits, and manages characters using the shared tool registry; launches multi-character scenes from the chat interface.
 - **Multi-character conversations** (`/conversations`) — background-job simulation of scenes with ORCHESTRATOR or ROUND_ROBIN turn strategies (1–500 turns), streamed in real time.
 - **MCP server** — the same 9 tools exposed to any external agent client over StreamableHTTP, JWT-authenticated.
-- **Behavioural-fidelity evaluation** (`/evaluation`) — offline 4-pass pipeline (generate → judge → reconstruct → drift) measuring whether generated dialogue preserves personality signal end-to-end.
+- **Behavioural-fidelity evaluation** (`/evaluation`) — generate a conversation dataset, then run three independent analysis passes in parallel: character identification, persona reconstruction, and context drift.
 - **LLM usage & cost tracking** (`/settings/usage`) — per-call logging of model, prompt hash, latency, and cost across all production and evaluation runs.
 
 ---
@@ -118,7 +118,7 @@ ln -sf ../.env.local mcp_server/.env.local
 | `LLM_API_KEY`                          | Yes         | API key for the provider at `LLM_BASE_URL`                                                                            |
 | `CONVERSATION_MODEL`                   | Yes         | Model name passed directly to the provider, e.g. `gemini/gemini-2.5-flash-lite`                                      |
 | `EVAL_ALLOWED_EMAILS`                  | No          | Comma-separated list of emails allowed to access the evaluation dashboard                                             |
-| `EVAL_RESULTS_PATH`                    | No          | Absolute path to the directory where evaluation results are stored                                                    |
+| `EVAL_RESULTS_PATH`                    | For evaluation | Absolute path to the directory where evaluation results are stored                                                 |
 
 > **Note on `MCP_AUTH_DISABLED`:** When set to `"true"`, the MCP server accepts tool calls without a valid JWT. Never enable this in production.
 
@@ -139,7 +139,10 @@ ln -sf ../.env.local mcp_server/.env.local
 # 3. Run database migrations
 bun run prisma:migrate:dev
 
-# 4. Start both servers (frontend on :3000, MCP on :3001)
+# 4. Generate both Prisma clients (Prisma 7 migrations do not generate them)
+bun run prisma:generate
+
+# 5. Start both servers (frontend on :3000, MCP on :3001)
 bun run dev
 ```
 
@@ -169,19 +172,22 @@ After setup, open [http://localhost:3000](http://localhost:3000).
 | `bun run prisma:migrate:dev`    | Create and apply a new migration in development (prompts for a migration name) |
 | `bun run prisma:migrate:deploy` | Apply pending migrations — use this in CI/CD and production                    |
 | `bun run prisma:migrate:status` | Show which migrations have been applied and which are pending                  |
-| `bun run prisma:generate`       | Regenerate the Prisma client after schema changes                              |
+| `bun run prisma:generate`       | Generate both Prisma clients after a fresh install or schema changes            |
 | `bun run prisma:studio`         | Open Prisma Studio (visual DB browser) at `http://localhost:5555`              |
 
 ### Type Checking
 
 | Command                      | Description                                   |
 | ---------------------------- | --------------------------------------------- |
-| `bun run typecheck`          | Type-check all workspaces (frontend + shared) |
+| `bun run typecheck`          | Type-check all workspaces (frontend + shared + MCP server) |
 | `bun run typecheck:frontend` | Type-check the frontend only                  |
 | `bun run typecheck:shared`   | Type-check the shared package only            |
+| `bun run typecheck:mcp`      | Type-check the MCP server only                |
+
+Run the MCP tests with `bun test --cwd mcp_server --isolate` after generating the Prisma clients. The mocked tests still require `DATABASE_URL` and `EXA_API_KEY` to be defined during module initialization; placeholder values suffice for these tests.
 
 ---
 
 ## Evaluation
 
-The offline evaluation pipeline measures LLM behavioural fidelity end-to-end across four sequential passes (generate → judge → reconstruct → drift). See [`evaluation/README.md`](evaluation/README.md) for the full reference.
+The batch evaluation pipeline analyzes generated dialogue using three independent passes: judge guessing, persona reconstruction, and context drift. Generate the dataset first, then run the analyses in parallel. See [`evaluation/README.md`](evaluation/README.md) for the commands, required configuration, outputs, and interpretation limits.

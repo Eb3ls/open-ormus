@@ -41,8 +41,8 @@ cp .env.example .env.local                     # fill in DATABASE_URL, DIRECT_UR
 ln -sf ../.env.local frontend/.env.local       # frontend reads from root source of truth
 ln -sf ../.env.local mcp_server/.env.local     # mcp_server reads from root source of truth
 bun run prisma:migrate:dev                     # run DB migrations
-bun run dev:frontend                           # start Next.js on :3000
-bun run dev:mcp                                # start MCP server on :3001
+bun run prisma:generate                        # generate both clients (required with Prisma 7)
+bun run dev                                    # start frontend on :3000 and MCP on :3001
 ```
 
 **Env file layout**
@@ -59,14 +59,15 @@ mcp_server/.env.local← symlink → ../.env.local
 
 | Goal | Command (run from repo root) |
 | ---- | ---- |
-| Frontend dev server | `bun run dev:frontend` |
-| MCP server dev (watch) | `bun run dev:mcp` |
+| Both dev servers | `bun run dev` |
+| Frontend dev server only | `bun run --cwd frontend dev` |
+| MCP server dev (watch) only | `bun run --cwd mcp_server dev` |
 | Build frontend | `bun run build` |
-| Type-check (all)   | `bun run typecheck` |
+| Type-check all workspaces (frontend, shared, MCP) | `bun run typecheck` |
 | Prisma migrate (dev) | `bun run prisma:migrate:dev` |
 | Prisma generate client | `bun run prisma:generate` |
 | Prisma Studio | `bun run prisma:studio` |
-| Run tests (mcp_server) | `bun test --cwd mcp_server` |
+| Run tests (mcp_server) | `bun test --cwd mcp_server --isolate` (generate clients first; `DATABASE_URL` and `EXA_API_KEY` must be defined, placeholders suffice for mocked tests) |
 
 ---
 
