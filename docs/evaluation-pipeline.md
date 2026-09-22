@@ -137,12 +137,13 @@ $EVAL_RESULTS_PATH/<dataset>/
 ├── generate-config.yaml
 ├── conversations/
 ├── costs/
-│   ├── generation.yaml
-│   ├── judge_guessing.yaml
-│   ├── reconstruct_persona.yaml
-│   └── context_drift.yaml
+│   └── generation.yaml
 └── eval-XX/
     ├── meta.yaml
+    ├── costs/
+    │   ├── judge_guessing.yaml
+    │   ├── reconstruct_persona.yaml
+    │   └── context_drift.yaml
     ├── judge_guessing/
     ├── reconstruct_persona/
     └── context_drift/
